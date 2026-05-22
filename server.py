@@ -38,6 +38,40 @@ class SmartConnectionsDatabase:
         if self.model is None:
             self.model = SentenceTransformer(self.model_name)
 
+    @staticmethod
+    def _resolve_path_from_key(key: str) -> str:
+        """
+        Derive the vault-relative source file path from a Smart Connections key.
+
+        Keys look like:
+          smart_sources:path/to/file.md
+          smart_blocks:path/to/file.md#Heading#{n}
+        """
+        if not key or ':' not in key:
+            return None
+        after_prefix = key.split(':', 1)[1]
+        return after_prefix.split('#', 1)[0]
+
+    def _read_block_text(self, source_path: str, lines) -> str:
+        """
+        Read a 1-indexed inclusive line range from a vault file.
+        Returns '' on any failure (missing file, bad range, decode error).
+        """
+        if not source_path or not lines or len(lines) < 2:
+            return ''
+        try:
+            file_path = self.vault_path / source_path
+            if not file_path.exists():
+                return ''
+            start, end = int(lines[0]), int(lines[1])
+            with open(file_path, 'r', encoding='utf-8') as f:
+                all_lines = f.readlines()
+            start_idx = max(0, start - 1)
+            end_idx = min(len(all_lines), end)
+            return ''.join(all_lines[start_idx:end_idx])
+        except Exception:
+            return ''
+
     def load_embeddings(self):
         """Load all .ajson embedding files (lazy loading)"""
         if self.embeddings_loaded:
@@ -66,13 +100,23 @@ class SmartConnectionsDatabase:
 
                     for key, item in data.items():
                         if 'embeddings' in item and 'TaylorAI/bge-micro-v2' in item['embeddings']:
-                            vec = item['embeddings']['TaylorAI/bge-micro-v2']['vec']
+                            vec = item['embeddings']['TaylorAI/bge-micro-v2'].get('vec', None)
+                            if vec is None or len(vec) != 384:
+                                continue
+
+                            # Newer Smart Connections versions store thin block
+                            # entries with path=null and text=null; reconstruct
+                            # the source path from the key so downstream code
+                            # can read the actual content from disk on demand.
+                            resolved_path = item.get('path')
+                            if not resolved_path:
+                                resolved_path = self._resolve_path_from_key(key)
 
                             # Store in cache
                             self.embeddings_cache[key] = {
-                                'path': item.get('path'),
+                                'path': resolved_path,
                                 'vector': np.array(vec, dtype=np.float32),
-                                'text': item.get('text', ''),
+                                'text': item.get('text') or '',
                                 'key': key,
                                 'lines': item.get('lines', []),
                                 'metadata': item.get('metadata', {})
@@ -120,13 +164,32 @@ class SmartConnectionsDatabase:
                     'similarity': similarity,
                     'lines': item.get('lines'),
                     'metadata': item.get('metadata', {}),
-                    'text_preview': item.get('text', '')[:200] if item.get('text') else ''
+                    'text_preview': (item.get('text') or '')[:200]
                 })
 
         # Sort by similarity descending
         results.sort(key=lambda x: x['similarity'], reverse=True)
+        top = results[:limit]
 
-        return results[:limit]
+        # Hydrate text_preview from disk only for returned results
+        # (newer Smart Connections doesn't store text in the embeddings DB)
+        for r in top:
+            if r['text_preview']:
+                continue
+            key = r['key']
+            if key.startswith('smart_blocks:'):
+                full = self._read_block_text(r['path'], r.get('lines'))
+                r['text_preview'] = full[:200]
+            elif key.startswith('smart_sources:') and r['path']:
+                try:
+                    file_path = self.vault_path / r['path']
+                    if file_path.exists():
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            r['text_preview'] = f.read(400)[:200]
+                except Exception:
+                    pass
+
+        return top
 
     def find_related(self, file_path: str, limit: int = 10) -> List[Dict]:
         """
@@ -211,11 +274,21 @@ class SmartConnectionsDatabase:
                     'path': item['path'],
                     'similarity': similarity,
                     'lines': item.get('lines'),
-                    'text': item.get('text', '')
+                    'text': item.get('text') or ''
                 })
 
         results.sort(key=lambda x: x['similarity'], reverse=True)
-        return results[:max_blocks]
+        top = results[:max_blocks]
+
+        # Hydrate text from disk for returned blocks (newer Smart Connections
+        # stores empty text in the .ajson and expects on-demand reconstruction).
+        for r in top:
+            if r['text']:
+                continue
+            if r['key'].startswith('smart_blocks:'):
+                r['text'] = self._read_block_text(r['path'], r.get('lines'))
+
+        return top
 
 
 async def main():
