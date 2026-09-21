@@ -19,14 +19,19 @@ Two .smart-env layouts are supported:
 
 The v3 layout is preferred; multi/ is only read when v3 yields nothing.
 
-Startup: sentence-transformers / torch take 10 to 40 seconds to import, and
-the model and index are loaded before the stdio transport starts. This is
-deliberate. Importing them after the transport is listening deadlocks on
-Windows: scipy's bundled OpenBLAS (pulled in via scikit-learn) waits on a
-C-runtime lock that the stdin reader thread holds while blocked in a read.
-Verified 2026-09-17, both in a background thread and in the main thread.
-So the MCP client must allow more than the default 30 s to connect: set
-"timeout" on this server's entry in .mcp.json (120000 works).
+Startup: torch + transformers take about 8 to 10 seconds to import, and the
+model and index are loaded before the stdio transport starts. This is
+deliberate. Importing heavy native libraries after the transport is listening
+deadlocks on Windows: scipy's bundled OpenBLAS waited on a C-runtime lock that
+the stdin reader thread held while blocked in a read. Verified 2026-09-17,
+both in a background thread and in the main thread.
+
+sentence-transformers was dropped on 2026-09-21: its import alone took 27.5 s
+(scikit-learn, scipy, training utilities) against the desktop app's fixed
+30 s connect timeout, which the "timeout" field in .mcp.json does not extend.
+The model (bge-micro-v2) uses mean pooling + L2 normalisation, so the direct
+transformers path below reproduces SentenceTransformer.encode() exactly
+(cosine 1.0 on test queries).
 """
 
 import asyncio
@@ -41,7 +46,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from sentence_transformers import SentenceTransformer  # slow import; must happen before stdio starts, see module docstring
+import torch  # slow imports; must happen before stdio starts, see module docstring
+from transformers import AutoModel, AutoTokenizer
 
 from mcp.server.models import InitializationOptions
 import mcp.types as types
@@ -68,6 +74,7 @@ class SmartConnectionsDatabase:
         self.blocks_path = self.smart_env_path / "smart_blocks"
 
         self.model = None
+        self.tokenizer = None
         self.model_name, self.dims = self._read_model_config()
 
         # key -> {'path','vector','text','key','lines','metadata'}
@@ -119,17 +126,34 @@ class SmartConnectionsDatabase:
         with self._lock:
             if self.model is None:
                 t0 = time.time()
-                self.model = SentenceTransformer(self.model_name)
+                torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                self.model = AutoModel.from_pretrained(self.model_name).eval()
                 logger.info("Model %s loaded in %.1fs", self.model_name, time.time() - t0)
 
     def warm_up(self):
-        """Load model and index up front. Runs before the stdio transport starts."""
+        """Load the model and run one throwaway encode so every native kernel
+        torch needs is initialised. Runs before the stdio transport starts.
+        The index itself is plain file IO + numpy and is loaded afterwards
+        (see main), so it does not count against the connect timeout."""
         try:
             self.ensure_model_loaded()
-            self.load_embeddings()
+            self._encode("warm-up")
         except Exception as e:  # keep the server alive, report on first call
             self.warm_up_error = f"{type(e).__name__}: {e}"
             logger.exception("Warm-up failed")
+
+    def load_index_in_background(self):
+        """Called once the transport is listening. Safe on Windows because no
+        new native modules are imported here; a concurrent query simply waits
+        on self._lock until the load finishes."""
+        try:
+            t0 = time.time()
+            self.load_embeddings()
+            logger.info("Index ready in %.1fs", time.time() - t0)
+        except Exception as e:
+            self.warm_up_error = f"{type(e).__name__}: {e}"
+            logger.exception("Index load failed")
 
     # ------------------------------------------------------------------
     # Loading
@@ -362,7 +386,13 @@ class SmartConnectionsDatabase:
         self.load_embeddings()
 
     def _encode(self, text: str) -> np.ndarray:
-        q = np.asarray(self.model.encode(text), dtype=np.float32)
+        """Mean-pooled, L2-normalised embedding; equals SentenceTransformer.encode() for bge-micro-v2."""
+        with torch.no_grad():
+            batch = self.tokenizer(text, padding=True, truncation=True, max_length=512, return_tensors="pt")
+            hidden = self.model(**batch).last_hidden_state
+            mask = batch["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+            pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+        q = pooled[0].numpy().astype(np.float32)
         n = np.linalg.norm(q)
         return q / n if n else q
 
@@ -562,14 +592,16 @@ async def main():
             raise RuntimeError(f"Tool execution error: {e}")
         return [types.TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
 
-    # Load the model and index BEFORE the transport starts listening. Doing it
-    # afterwards, in any thread, deadlocks on Windows (see module docstring).
+    # Load the model BEFORE the transport starts listening. Importing native
+    # libraries afterwards, in any thread, deadlocks on Windows (see module
+    # docstring). The index is only file IO and loads after the handshake.
     t0 = time.time()
     db.warm_up()
     logger.info("Warm-up done in %.1fs", time.time() - t0)
 
     logger.info("Starting stdio server...")
     async with stdio_server() as (read_stream, write_stream):
+        index_task = asyncio.create_task(asyncio.to_thread(db.load_index_in_background))
         await server.run(
             read_stream,
             write_stream,
@@ -579,6 +611,7 @@ async def main():
                 capabilities=types.ServerCapabilities(tools=types.ToolsCapability()),
             ),
         )
+        index_task.cancel()
         logger.info("MCP server finished")
 
 
