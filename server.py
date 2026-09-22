@@ -19,19 +19,23 @@ Two .smart-env layouts are supported:
 
 The v3 layout is preferred; multi/ is only read when v3 yields nothing.
 
-Startup: torch + transformers take about 8 to 10 seconds to import, and the
-model and index are loaded before the stdio transport starts. This is
-deliberate. Importing heavy native libraries after the transport is listening
-deadlocks on Windows: scipy's bundled OpenBLAS waited on a C-runtime lock that
-the stdin reader thread held while blocked in a read. Verified 2026-09-17,
-both in a background thread and in the main thread.
+Startup: the query embedder runs on ONNX Runtime (import plus session about
+1 s) with the `tokenizers` library. Model files live in models/<name>/ next
+to this file and are fetched from the Hugging Face hub once if missing. The
+model is loaded before the stdio transport starts. This is deliberate.
+Importing heavy native libraries after the transport is listening deadlocks
+on Windows: scipy's bundled OpenBLAS waited on a C-runtime lock that the
+stdin reader thread held while blocked in a read. Verified 2026-09-17, both
+in a background thread and in the main thread. The index is plain file IO
+and numpy, so it loads in the background after the handshake.
 
-sentence-transformers was dropped on 2026-09-21: its import alone took 27.5 s
-(scikit-learn, scipy, training utilities) against the desktop app's fixed
-30 s connect timeout, which the "timeout" field in .mcp.json does not extend.
-The model (bge-micro-v2) uses mean pooling + L2 normalisation, so the direct
-transformers path below reproduces SentenceTransformer.encode() exactly
-(cosine 1.0 on test queries).
+History: sentence-transformers was dropped on 2026-09-21 (its import alone
+took 27.5 s). torch + transformers were dropped on 2026-09-22: their 8 to
+10 s warm import stretched past 40 s on a cold cache, and the desktop app's
+fixed 30 s connect timeout (not extended by "timeout" in .mcp.json) then
+killed the server. The fp32 ONNX export of bge-micro-v2 reproduces the
+torch mean-pooled, L2-normalised vector exactly (cosine 1.000000 on test
+queries); the quantized export drifts to about 0.97 and is not used.
 """
 
 import asyncio
@@ -46,8 +50,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import torch  # slow imports; must happen before stdio starts, see module docstring
-from transformers import AutoModel, AutoTokenizer
+import onnxruntime as ort  # native import; must happen before stdio starts, see module docstring
+from tokenizers import Tokenizer
 
 from mcp.server.models import InitializationOptions
 import mcp.types as types
@@ -58,6 +62,12 @@ logger = logging.getLogger("smart-connections-mcp")
 
 DEFAULT_MODEL = 'TaylorAI/bge-micro-v2'
 DEFAULT_DIMS = 384
+
+# models/<repo name>/ holds the fp32 ONNX export and the tokenizer of the model
+# Smart Connections is configured with (hub layout: onnx/model.onnx, tokenizer.json).
+MODELS_DIR = Path(__file__).resolve().parent / "models"
+MODEL_FILES = ("model.onnx", "tokenizer.json")
+MAX_TOKENS = 512
 
 # Matches one line of an .ajson append log:  "key": <json>,
 _AJSON_LINE = re.compile(r'^\s*"((?:[^"\\]|\\.)*)"\s*:\s*(.*?),?\s*$')
@@ -73,8 +83,10 @@ class SmartConnectionsDatabase:
         self.sources_path = self.smart_env_path / "smart_sources"
         self.blocks_path = self.smart_env_path / "smart_blocks"
 
-        self.model = None
-        self.tokenizer = None
+        self.model = None            # onnxruntime.InferenceSession
+        self.tokenizer = None        # tokenizers.Tokenizer
+        self.model_path: Optional[Path] = None
+        self._input_names: set = set()
         self.model_name, self.dims = self._read_model_config()
 
         # key -> {'path','vector','text','key','lines','metadata'}
@@ -121,19 +133,48 @@ class SmartConnectionsDatabase:
     # Model
     # ------------------------------------------------------------------
 
+    def _model_dir(self) -> Path:
+        return MODELS_DIR / self.model_name.split('/')[-1]
+
+    def _ensure_model_files(self) -> Path:
+        """Return the local model folder, fetching missing files from the hub.
+        The download path imports huggingface_hub, which is only acceptable
+        here because warm_up() runs before the stdio transport starts."""
+        d = self._model_dir()
+        missing = [f for f in MODEL_FILES if not (d / f).exists()]
+        if missing:
+            logger.info("Fetching %s for %s from the Hugging Face hub", missing, self.model_name)
+            import shutil
+            from huggingface_hub import hf_hub_download
+            d.mkdir(parents=True, exist_ok=True)
+            for f in missing:
+                remote = f"onnx/{f}" if f.endswith('.onnx') else f
+                shutil.copyfile(hf_hub_download(self.model_name, remote), d / f)
+        return d
+
     def ensure_model_loaded(self):
-        """Load the embedding model once."""
+        """Load the tokenizer and the ONNX session once."""
         with self._lock:
             if self.model is None:
                 t0 = time.time()
-                torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
-                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-                self.model = AutoModel.from_pretrained(self.model_name).eval()
-                logger.info("Model %s loaded in %.1fs", self.model_name, time.time() - t0)
+                d = self._ensure_model_files()
+                tok = Tokenizer.from_file(str(d / "tokenizer.json"))
+                tok.enable_truncation(MAX_TOKENS)
+                tok.no_padding()  # the hub tokenizer.json ships with padding to 512 switched on
+                so = ort.SessionOptions()
+                so.intra_op_num_threads = max(1, min(4, os.cpu_count() or 1))
+                so.log_severity_level = 3  # errors only
+                sess = ort.InferenceSession(str(d / "model.onnx"), so, providers=["CPUExecutionProvider"])
+                self._input_names = {i.name for i in sess.get_inputs()}
+                self.tokenizer = tok
+                self.model = sess
+                self.model_path = d / "model.onnx"
+                logger.info("Model %s loaded on onnxruntime %s in %.1fs",
+                            self.model_name, ort.__version__, time.time() - t0)
 
     def warm_up(self):
-        """Load the model and run one throwaway encode so every native kernel
-        torch needs is initialised. Runs before the stdio transport starts.
+        """Load the model and run one throwaway encode so onnxruntime's
+        kernels are initialised. Runs before the stdio transport starts.
         The index itself is plain file IO + numpy and is loaded afterwards
         (see main), so it does not count against the connect timeout."""
         try:
@@ -386,13 +427,20 @@ class SmartConnectionsDatabase:
         self.load_embeddings()
 
     def _encode(self, text: str) -> np.ndarray:
-        """Mean-pooled, L2-normalised embedding; equals SentenceTransformer.encode() for bge-micro-v2."""
-        with torch.no_grad():
-            batch = self.tokenizer(text, padding=True, truncation=True, max_length=512, return_tensors="pt")
-            hidden = self.model(**batch).last_hidden_state
-            mask = batch["attention_mask"].unsqueeze(-1).to(hidden.dtype)
-            pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-        q = pooled[0].numpy().astype(np.float32)
+        """Mean-pooled, L2-normalised embedding of one text. Matches the
+        former torch/transformers path and SentenceTransformer.encode() for
+        bge-micro-v2 (cosine 1.000000 on test queries, 2026-09-22)."""
+        enc = self.tokenizer.encode(text)
+        feeds = {
+            "input_ids": np.asarray([enc.ids], dtype=np.int64),
+            "attention_mask": np.asarray([enc.attention_mask], dtype=np.int64),
+        }
+        if "token_type_ids" in self._input_names:
+            feeds["token_type_ids"] = np.asarray([enc.type_ids], dtype=np.int64)
+        hidden = self.model.run(None, feeds)[0]                 # (1, seq, dims)
+        mask = feeds["attention_mask"][..., None].astype(np.float32)
+        pooled = (hidden * mask).sum(1) / np.maximum(mask.sum(1), 1e-9)
+        q = pooled[0].astype(np.float32)
         n = np.linalg.norm(q)
         return q / n if n else q
 
@@ -486,6 +534,8 @@ class SmartConnectionsDatabase:
                 'vault_path': str(self.vault_path),
                 'layout': self.layout,
                 'model': self.model_name,
+                'model_file': str(self.model_path) if self.model_path else None,
+                'runtime': f"onnxruntime {ort.__version__}",
                 'dims': self.dims,
                 'model_loaded': self.model is not None,
                 'vectors_total': n,
@@ -607,7 +657,7 @@ async def main():
             write_stream,
             InitializationOptions(
                 server_name="smart-connections-mcp",
-                server_version="0.2.0",
+                server_version="0.3.0",
                 capabilities=types.ServerCapabilities(tools=types.ToolsCapability()),
             ),
         )
