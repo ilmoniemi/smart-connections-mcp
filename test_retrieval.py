@@ -110,6 +110,23 @@ class V3LayoutTests(unittest.TestCase):
         self.assertEqual(sorted(self.db.embeddings_cache),
                          ['smart_sources:note.md', 'smart_sources:other.md'])
 
+    def test_paths_outside_the_vault_are_not_read(self):
+        outside = self.root.parent / 'outside.md'
+        outside.write_text('Outside secret\nOutside secret\n')
+        (self.root / 'link.md').symlink_to(outside)
+        block = {'key': '../outside.md#Top', 'lines': [1, 2], 'embedding': self.ref(0)}
+        entries = {
+            'smart_sources:note.md': self.source('note.md', 0),
+            'smart_sources:../outside.md': dict(self.source('../outside.md', 0), blocks_data={'#Top': block}),
+            'smart_sources:link.md': self.source('link.md', 0),
+            'smart_sources:' + str(outside): self.source(str(outside), 0),
+        }
+        self.write_index(entries)
+        hits = self.db.semantic_search('passage', limit=10) + self.db.get_context_blocks('passage')
+        self.assertTrue(any('Relevant passage' in r.get('text_preview', '') for r in hits))
+        for r in hits:
+            self.assertNotIn('Outside secret', r.get('text_preview', '') + r.get('text', ''))
+
 
 if __name__ == '__main__':
     unittest.main()

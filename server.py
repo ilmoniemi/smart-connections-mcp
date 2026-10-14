@@ -78,6 +78,7 @@ class SmartConnectionsDatabase:
 
     def __init__(self, vault_path: str):
         self.vault_path = Path(vault_path)
+        self._vault_root = self.vault_path.resolve()  # result paths must resolve inside this
         self.smart_env_path = self.vault_path / ".smart-env"
         self.multi_path = self.smart_env_path / "multi"
         self.sources_path = self.smart_env_path / "smart_sources"
@@ -401,12 +402,25 @@ class SmartConnectionsDatabase:
     # Text hydration (v3 stores no text; read the vault file on demand)
     # ------------------------------------------------------------------
 
+    def _vault_file(self, source_path: str) -> Optional[Path]:
+        """The note's file, or None if it is missing or resolves outside the
+        vault (a ../ path, an absolute path or a symlink in the index)."""
+        if not isinstance(source_path, str) or not source_path:
+            return None
+        try:
+            file_path = (self.vault_path / source_path).resolve()
+        except (OSError, RuntimeError):
+            return None
+        if not file_path.is_relative_to(self._vault_root) or not file_path.is_file():
+            return None
+        return file_path
+
     def _read_block_text(self, source_path: str, lines) -> str:
         if not source_path or not lines or len(lines) < 2:
             return ''
         try:
-            file_path = self.vault_path / source_path
-            if not file_path.exists():
+            file_path = self._vault_file(source_path)
+            if file_path is None:
                 return ''
             start, end = int(lines[0]), int(lines[1])
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -417,8 +431,8 @@ class SmartConnectionsDatabase:
 
     def _read_source_head(self, source_path: str, n: int = 400) -> str:
         try:
-            file_path = self.vault_path / source_path
-            if file_path.exists():
+            file_path = self._vault_file(source_path)
+            if file_path is not None:
                 with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                     return f.read(n)
         except Exception:
