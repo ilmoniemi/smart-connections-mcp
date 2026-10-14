@@ -55,6 +55,15 @@ class LegacyLayoutTests(unittest.TestCase):
         self.db.load_embeddings()
         self.assertEqual(list(self.db.embeddings_cache), ['smart_sources:note.md'])
 
+    def test_file_rewritten_in_place_is_reloaded(self):
+        self.write_index({'smart_sources:note.md': self.entry('note.md', [1.0] * DIMS)})
+        self.db.load_embeddings()
+        self.assertEqual(len(self.db.embeddings_cache), 1)
+        # Same file name, so the folder's own mtime and file count do not change.
+        (self.multi / 'test.ajson').write_text('{}')
+        self.db.load_embeddings()
+        self.assertEqual(self.db.embeddings_cache, {})
+
 
 if __name__ == '__main__':
     unittest.main()

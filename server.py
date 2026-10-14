@@ -240,11 +240,13 @@ class SmartConnectionsDatabase:
                     except OSError:
                         pass
         if not sig and self.multi_path.exists():
-            try:
-                st = self.multi_path.stat()
-                sig.append((str(self.multi_path), st.st_mtime_ns, len(os.listdir(self.multi_path))))
-            except OSError:
-                pass
+            # Per file: a file rewritten in place leaves the folder's mtime unchanged.
+            for p in sorted(self.multi_path.glob("*.ajson")):
+                try:
+                    st = p.stat()
+                    sig.append((str(p), st.st_mtime_ns, st.st_size))
+                except OSError:
+                    pass
         return tuple(sig)
 
     @staticmethod
