@@ -341,11 +341,17 @@ class SmartConnectionsDatabase:
                     continue
                 emb = (item.get('embeddings') or {}).get(self.model_name) or {}
                 vec = emb.get('vec')
-                if not vec or len(vec) != self.dims:
+                if not isinstance(vec, list) or len(vec) != self.dims:
+                    continue
+                # The plugin may be rewriting the file; one bad value skips this entry only.
+                try:
+                    vector = np.asarray(vec, dtype=np.float32)
+                except (TypeError, ValueError):
+                    logger.warning("Skipping non-numeric vector for %s", key)
                     continue
                 cache[key] = {
                     'path': item.get('path') or self._resolve_path_from_key(key),
-                    'vector': np.asarray(vec, dtype=np.float32),
+                    'vector': vector,
                     'text': item.get('text') or '',
                     'key': key,
                     'lines': item.get('lines', []),
