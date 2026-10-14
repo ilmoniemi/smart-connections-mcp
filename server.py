@@ -19,6 +19,10 @@ Two .smart-env layouts are supported:
 
 The v3 layout is preferred; multi/ is only read when v3 yields nothing.
 
+Transport: stdio by default. `server.py --http PORT` serves stateless
+Streamable HTTP at http://127.0.0.1:PORT/mcp instead, so several sessions
+share one process; see http_app(). Its imports happen only in that mode.
+
 Startup: the query embedder runs on ONNX Runtime (import plus session about
 1 s) with the `tokenizers` library. Model files live in models/<name>/ next
 to this file and are fetched from the Hugging Face hub once if missing. The
@@ -665,9 +669,61 @@ TOOLS = [
 ]
 
 
+def http_app(server: Server, port: int):
+    """Streamable HTTP app for http://127.0.0.1:PORT/mcp.
+
+    Stateless, so a restarted server needs no session handshake from clients
+    that stayed open. Host and Origin checks stop a web page in a browser
+    from reaching the vault through this port (DNS rebinding included).
+    """
+    import contextlib
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    hosts = [f"127.0.0.1:{port}", f"localhost:{port}"]
+    manager = StreamableHTTPSessionManager(
+        app=server,
+        stateless=True,
+        json_response=True,
+        security_settings=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=hosts,
+            allowed_origins=[f"http://{host}" for host in hosts],
+        ),
+    )
+
+    class Endpoint:
+        """A class instance, so Starlette passes the raw request through instead of wrapping it."""
+
+        async def __call__(self, scope, receive, send):
+            await manager.handle_request(scope, receive, send)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        async with manager.run():
+            yield
+
+    return Starlette(routes=[Route("/mcp", endpoint=Endpoint(), methods=["GET", "POST", "DELETE"])],
+                     lifespan=lifespan)
+
+
+async def serve_http(server: Server, port: int):
+    """Serve http_app on 127.0.0.1 only. Imported here so stdio never needs it."""
+    import uvicorn
+    config = uvicorn.Config(http_app(server, port), host="127.0.0.1", port=port, log_level="warning")
+    await uvicorn.Server(config).serve()
+
+
 async def main():
+    # `--http PORT` serves every session from one long-lived process instead of one per session.
+    http_port = int(sys.argv[sys.argv.index('--http') + 1]) if '--http' in sys.argv else None
+
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format='%(asctime)s - %(levelname)s - %(message)s')
+    if http_port:
+        logging.getLogger('mcp').setLevel(logging.WARNING)  # two lines per request otherwise
     logger.info("Starting smart-connections-mcp server...")
 
     vault_path = os.getenv('OBSIDIAN_VAULT_PATH')
@@ -715,6 +771,14 @@ async def main():
     t0 = time.time()
     db.warm_up()
     logger.info("Warm-up done in %.1fs", time.time() - t0)
+
+    if http_port:
+        # Same order as stdio: model first, then the index in the background.
+        index_task = asyncio.create_task(asyncio.to_thread(db.load_index_in_background))
+        logger.info("Serving streamable HTTP at http://127.0.0.1:%d/mcp", http_port)
+        await serve_http(server, http_port)
+        index_task.cancel()
+        return
 
     logger.info("Starting stdio server...")
     async with stdio_server() as (read_stream, write_stream):

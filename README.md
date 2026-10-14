@@ -27,7 +27,7 @@ python3.12 -m venv .venv
 
 On Windows, use `.venv\Scripts\pip` and `.venv\Scripts\python`.
 
-`requirements.txt` keeps the MCP Python SDK below version 2, because version 2 removed the server API this code uses.
+`requirements.txt` keeps the MCP Python SDK at 1.10 or later, the first release with the HTTP transport's Host and Origin checks, and below version 2, because version 2 removed the server API this code uses.
 
 The first start downloads the ONNX model (about 70 MB) into `models/` next to the server. Do it once by hand, so the first Claude session does not wait for the download:
 
@@ -64,6 +64,66 @@ Start a new Claude Code session and approve the server. The tools are `semantic_
 Call `get_stats`. `layout` should be `smart-environment-v3` and `vectors_total` should be in the thousands for a vault of any size. Then search for something you wrote today. If recent notes are missing, check `index_changed_on_disk` and that Obsidian is running, since the plugin only indexes while Obsidian is open.
 
 Run the same check after every Smart Connections plugin update. The plugin changed its storage format twice in 2026, and both times the symptom was old or empty results rather than an error.
+
+### Share one server between sessions (HTTP)
+
+By default every Claude Code session starts its own copy of the server over stdio, each with its own model and index in memory. With `--http PORT`, one long-running process serves every session over Streamable HTTP instead:
+
+```bash
+OBSIDIAN_VAULT_PATH="/path/to/your/vault" .venv/bin/python server.py --http 37411
+```
+
+It listens on `127.0.0.1` only, at `http://127.0.0.1:37411/mcp`. It is stateless, so a client that stayed open keeps working after the server restarts. Requests whose `Host` header is not `127.0.0.1:PORT` or `localhost:PORT`, or that carry the `Origin` of a web page, are refused, so a website open in a browser cannot query the vault through the port. This needs MCP Python SDK 1.10 or later, which `requirements.txt` already asks for.
+
+Point Claude Code at it in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "smart-connections": {
+      "type": "http",
+      "url": "http://127.0.0.1:37411/mcp"
+    }
+  }
+}
+```
+
+On macOS, a launchd agent keeps the server running. Save this as `~/Library/LaunchAgents/com.example.smart-connections-mcp.plist`, replace the paths, and load it with `launchctl load ~/Library/LaunchAgents/com.example.smart-connections-mcp.plist`. After a code change, restart it with `launchctl kickstart -k gui/$(id -u)/com.example.smart-connections-mcp`.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.example.smart-connections-mcp</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/you/tools/smart-connections-mcp/.venv/bin/python</string>
+		<string>/Users/you/tools/smart-connections-mcp/server.py</string>
+		<string>--http</string>
+		<string>37411</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>OBSIDIAN_VAULT_PATH</key>
+		<string>/Users/you/obsidian/Your Vault</string>
+	</dict>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/you/Library/Logs/smart-connections-mcp.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/you/Library/Logs/smart-connections-mcp.log</string>
+</dict>
+</plist>
+```
+
+`ProcessType` `Interactive` matters: with the default class, macOS may run the server on throttled cores under load, and every session waits on each search.
 
 ## Secret scanning
 
