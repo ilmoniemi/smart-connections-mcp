@@ -280,10 +280,11 @@ class SmartConnectionsDatabase:
                 mat = None
                 if name and p.exists():
                     raw = np.fromfile(p, dtype=np.float32)
-                    if raw.size % self.dims == 0:
-                        mat = raw.reshape(-1, self.dims)
-                    else:
-                        logger.warning("Vector file %s size %d not divisible by dims %d", p, raw.size, self.dims)
+                    partial = raw.size % self.dims
+                    if partial:
+                        # The plugin is appending a row; keep the complete rows before it.
+                        logger.warning("Vector file %s ends in a partial row (%d of %d values)", p, partial, self.dims)
+                    mat = raw[:raw.size - partial].reshape(-1, self.dims)
                 mf_cache[ck] = mat
             return mf_cache[ck]
 
