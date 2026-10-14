@@ -65,6 +65,13 @@ Call `get_stats`. `layout` should be `smart-environment-v3` and `vectors_total` 
 
 Run the same check after every Smart Connections plugin update. The plugin changed its storage format twice in 2026, and both times the symptom was old or empty results rather than an error.
 
+## Secret scanning
+
+[gitleaks](https://github.com/gitleaks/gitleaks) checks this repository in two places:
+
+- **On GitHub:** `.github/workflows/secret-scan.yml` scans the full history on every push and pull request.
+- **Before each commit:** `.githooks/pre-commit` refuses a commit that adds a secret. Install gitleaks (`brew install gitleaks` on macOS, `winget install Gitleaks.Gitleaks` on Windows) and turn the hook on once per clone with `git config core.hooksPath .githooks`.
+
 ## Troubleshooting
 
 | Symptom | Cause |

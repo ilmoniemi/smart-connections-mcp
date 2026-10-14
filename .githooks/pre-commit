@@ -1,0 +1,10 @@
+#!/bin/sh
+# Refuse a commit that adds a secret. Enable once per clone:
+#   git config core.hooksPath .githooks
+# Needs gitleaks on PATH: brew install gitleaks (macOS),
+# winget install Gitleaks.Gitleaks (Windows).
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks not found, secret scan skipped" >&2
+  exit 0
+fi
+exec gitleaks git --pre-commit --staged --redact --no-banner
