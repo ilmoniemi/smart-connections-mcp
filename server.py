@@ -69,6 +69,10 @@ MODELS_DIR = Path(__file__).resolve().parent / "models"
 MODEL_FILES = ("model.onnx", "tokenizer.json")
 MAX_TOKENS = 512
 
+# A note whose mtime is later than the one the index recorded changed after
+# indexing. The plugin records whole milliseconds, the file system finer.
+STALE_TOLERANCE_MS = 1
+
 # Matches one line of an .ajson append log:  "key": <json>,
 _AJSON_LINE = re.compile(r'^\s*"((?:[^"\\]|\\.)*)"\s*:\s*(.*?),?\s*$')
 
@@ -90,7 +94,7 @@ class SmartConnectionsDatabase:
         self._input_names: set = set()
         self.model_name, self.dims = self._read_model_config()
 
-        # key -> {'path','vector','text','key','lines','metadata'}
+        # key -> {'path','vector','text','key','lines','metadata','indexed_mtime'}
         self.embeddings_cache: Dict[str, Dict] = {}
         self._keys: List[str] = []
         self._matrix: Optional[np.ndarray] = None   # normalized, (N, dims)
@@ -294,6 +298,7 @@ class SmartConnectionsDatabase:
             if not key.startswith('smart_sources:'):
                 continue
             path = entry.get('path') or key.split(':', 1)[1]
+            indexed_mtime = (entry.get('last_import') or {}).get('mtime')
 
             ref = self._mf_ref(entry.get('embedding'))
             if ref:
@@ -303,6 +308,7 @@ class SmartConnectionsDatabase:
                     cache[key] = {
                         'path': path, 'vector': mat[i], 'text': '',
                         'key': key, 'lines': [], 'metadata': {},
+                        'indexed_mtime': indexed_mtime,
                     }
 
             for sub, block in (entry.get('blocks_data') or {}).items():
@@ -319,6 +325,7 @@ class SmartConnectionsDatabase:
                 cache[bkey] = {
                     'path': path, 'vector': mat[i], 'text': '',
                     'key': bkey, 'lines': block.get('lines') or [], 'metadata': {},
+                    'indexed_mtime': indexed_mtime,
                 }
         return cache
 
@@ -360,7 +367,14 @@ class SmartConnectionsDatabase:
                     'key': key,
                     'lines': item.get('lines', []),
                     'metadata': item.get('metadata', {}),
+                    'indexed_mtime': (item.get('last_import') or {}).get('mtime'),
                 }
+        # Block entries carry no index time of their own; use their note's.
+        for item in cache.values():
+            if item['indexed_mtime'] is None:
+                source = cache.get(f"smart_sources:{item['path']}")
+                if source:
+                    item['indexed_mtime'] = source['indexed_mtime']
         return cache
 
     def load_embeddings(self, force: bool = False):
@@ -439,6 +453,24 @@ class SmartConnectionsDatabase:
             pass
         return ''
 
+    def _check_hit(self, item) -> Optional[bool]:
+        """None if a hit is unusable, else whether its note changed after
+        indexing. Unusable: the note was deleted or resolves outside the
+        vault, or the hit is a passage of a note changed since indexing,
+        whose saved line range would quote the wrong text."""
+        file_path = self._vault_file(item['path'])
+        if file_path is None:
+            return None
+        try:
+            mtime_ms = file_path.stat().st_mtime_ns / 1e6
+        except OSError:
+            return None
+        indexed = item.get('indexed_mtime')
+        stale = isinstance(indexed, (int, float)) and mtime_ms > indexed + STALE_TOLERANCE_MS
+        if stale and item['key'].startswith('smart_blocks:'):
+            return None
+        return stale
+
     # ------------------------------------------------------------------
     # Queries
     # ------------------------------------------------------------------
@@ -474,27 +506,32 @@ class SmartConnectionsDatabase:
                 return []
             sims = self._matrix @ self._encode(query)
             order = np.argsort(-sims)
-            results = []
-            for idx in order:
-                s = float(sims[idx])
-                if s < min_similarity or len(results) >= limit:
-                    break
-                item = self.embeddings_cache[self._keys[idx]]
-                results.append({
-                    'key': item['key'],
-                    'path': item['path'],
-                    'similarity': s,
-                    'lines': item.get('lines'),
-                    'metadata': item.get('metadata', {}),
-                    'text_preview': (item.get('text') or '')[:200],
-                })
-        for r in results:
-            if r['text_preview']:
+            keys, cache = self._keys, self.embeddings_cache  # a reload replaces, never mutates
+        # Unusable hits are skipped and the next ones taken, so the limit is still filled.
+        results = []
+        for idx in order:
+            s = float(sims[idx])
+            if s < min_similarity or len(results) >= limit:
+                break
+            item = cache[keys[idx]]
+            stale = self._check_hit(item)
+            if stale is None:
                 continue
-            if r['key'].startswith('smart_blocks:'):
-                r['text_preview'] = self._read_block_text(r['path'], r.get('lines'))[:200]
-            elif r['path']:
-                r['text_preview'] = self._read_source_head(r['path'])[:200]
+            text = item.get('text') or ''
+            if not text:
+                if item['key'].startswith('smart_blocks:'):
+                    text = self._read_block_text(item['path'], item.get('lines'))
+                else:
+                    text = self._read_source_head(item['path'])
+            results.append({
+                'key': item['key'],
+                'path': item['path'],
+                'similarity': s,
+                'lines': item.get('lines'),
+                'metadata': item.get('metadata', {}),
+                'text_preview': text[:200],
+                'index_stale': stale,
+            })
         return results
 
     def find_related(self, file_path: str, limit: int = 10) -> List[Dict]:
@@ -509,19 +546,24 @@ class SmartConnectionsDatabase:
             sims = self._matrix @ self._matrix[ti]
             sims = np.where(self._is_block, -np.inf, sims)
             sims[ti] = -np.inf
-            order = np.argsort(-sims)[:limit]
-            out = []
-            for idx in order:
-                if not np.isfinite(sims[idx]):
-                    break
-                item = self.embeddings_cache[self._keys[idx]]
-                out.append({
-                    'key': item['key'],
-                    'path': item['path'],
-                    'similarity': float(sims[idx]),
-                    'metadata': item.get('metadata', {}),
-                })
-            return out
+            order = np.argsort(-sims)
+            keys, cache = self._keys, self.embeddings_cache
+        out = []
+        for idx in order:
+            if not np.isfinite(sims[idx]) or len(out) >= limit:
+                break
+            item = cache[keys[idx]]
+            stale = self._check_hit(item)
+            if stale is None:
+                continue
+            out.append({
+                'key': item['key'],
+                'path': item['path'],
+                'similarity': float(sims[idx]),
+                'metadata': item.get('metadata', {}),
+                'index_stale': stale,
+            })
+        return out
 
     def get_context_blocks(self, query: str, max_blocks: int = 5, min_similarity: float = 0.4) -> List[Dict]:
         with self._lock:
@@ -531,22 +573,24 @@ class SmartConnectionsDatabase:
             sims = self._matrix @ self._encode(query)
             sims = np.where(self._is_block, sims, -np.inf)
             order = np.argsort(-sims)
-            results = []
-            for idx in order:
-                s = float(sims[idx])
-                if not np.isfinite(s) or s <= min_similarity or len(results) >= max_blocks:
-                    break
-                item = self.embeddings_cache[self._keys[idx]]
-                results.append({
-                    'key': item['key'],
-                    'path': item['path'],
-                    'similarity': s,
-                    'lines': item.get('lines'),
-                    'text': item.get('text') or '',
-                })
-        for r in results:
-            if not r['text']:
-                r['text'] = self._read_block_text(r['path'], r.get('lines'))
+            keys, cache = self._keys, self.embeddings_cache
+        results = []
+        for idx in order:
+            s = float(sims[idx])
+            if not np.isfinite(s) or s <= min_similarity or len(results) >= max_blocks:
+                break
+            item = cache[keys[idx]]
+            stale = self._check_hit(item)
+            if stale is None:
+                continue
+            results.append({
+                'key': item['key'],
+                'path': item['path'],
+                'similarity': s,
+                'lines': item.get('lines'),
+                'text': item.get('text') or self._read_block_text(item['path'], item.get('lines')),
+                'index_stale': stale,
+            })
         return results
 
     def stats(self) -> Dict:
