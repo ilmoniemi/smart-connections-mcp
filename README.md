@@ -1,5 +1,85 @@
 # Smart Connections MCP Server
 
+Exposes the vector index of the Obsidian [Smart Connections](https://smartconnections.app/) plugin to Claude Code (and other MCP clients), so an assistant can search a vault by meaning.
+
+**About this fork.** The upstream repository has not been updated since October 2025. It reads only the old `.smart-env/multi/` layout, which Smart Connections stopped updating in version 4.7, so upstream keeps answering from a frozen index without any error. This fork reads the current layout and starts fast enough for Claude's fixed 30-second connect limit. The "Upstream documentation" part further down describes the original version and is partly out of date: it used sentence-transformers and torch, and it read `multi/`.
+
+## What this fork changes
+
+- **Smart Environment v3 layout (Smart Connections 4.7 and later).** Reads `smart_sources/*.ajson` and the binary vector files in `smart_sources/` and `smart_blocks/`. Falls back to `multi/` for older plugin versions.
+- **Thin block entries (Smart Connections 4.3 and later).** The plugin no longer stores a section's path or text, so the path comes from the entry key and the text is read from the note on disk.
+- **No torch.** Queries are embedded with ONNX Runtime and the `tokenizers` library. The server connects in under 2 seconds and the virtual environment stays small.
+- **`get_stats` tool.** Shows which layout is in use, vector counts, the model, and whether the index on disk changed since it was loaded. The index reloads by itself when the plugin rewrites it.
+- **Notes without a vector are skipped** (the plugin has not embedded them yet) instead of crashing the server.
+
+## Setup
+
+You need Python 3.12 and Obsidian with Smart Connections installed and indexed, using the plugin's default local model `TaylorAI/bge-micro-v2`. The server embeds your queries with the same model, so an index built with another model will not work.
+
+macOS or Linux:
+
+```bash
+git clone https://github.com/ilmoniemi/smart-connections-mcp.git ~/tools/smart-connections-mcp
+cd ~/tools/smart-connections-mcp
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+On Windows, use `.venv\Scripts\pip` and `.venv\Scripts\python`.
+
+`requirements.txt` keeps the MCP Python SDK below version 2, because version 2 removed the server API this code uses.
+
+The first start downloads the ONNX model (about 70 MB) into `models/` next to the server. Do it once by hand, so the first Claude session does not wait for the download:
+
+```bash
+OBSIDIAN_VAULT_PATH="/path/to/your/vault" .venv/bin/python test_handshake.py "a test query"
+```
+
+It prints how long the handshake takes, the index layout and vector count, and the top three results for the query.
+
+### Configure Claude Code
+
+Add the server to `.mcp.json` in the vault folder (or to the user-level `~/.claude.json` to make it available everywhere). Use absolute paths:
+
+```json
+{
+  "mcpServers": {
+    "smart-connections": {
+      "command": "/Users/you/tools/smart-connections-mcp/.venv/bin/python",
+      "args": ["/Users/you/tools/smart-connections-mcp/server.py"],
+      "env": {
+        "OBSIDIAN_VAULT_PATH": "/Users/you/obsidian/Your Vault"
+      }
+    }
+  }
+}
+```
+
+**Windows:** the `env` block replaces the whole process environment. Also pass `PATH`, `SystemRoot`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP` and `TMP`, or the server fails at startup with `WinError 10106`.
+
+Start a new Claude Code session and approve the server. The tools are `semantic_search`, `find_related`, `get_context_blocks` and `get_stats`.
+
+### Check that it works
+
+Call `get_stats`. `layout` should be `smart-environment-v3` and `vectors_total` should be in the thousands for a vault of any size. Then search for something you wrote today. If recent notes are missing, check `index_changed_on_disk` and that Obsidian is running, since the plugin only indexes while Obsidian is open.
+
+Run the same check after every Smart Connections plugin update. The plugin changed its storage format twice in 2026, and both times the symptom was old or empty results rather than an error.
+
+## Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `layout` is `legacy-multi` on a current plugin | The v3 files were not found under `.smart-env/smart_sources/`. Check `OBSIDIAN_VAULT_PATH` |
+| Results have empty paths or previews | The plugin moved to a storage format this server does not know yet |
+| `connection timed out after 30000ms` | Something slow is imported at startup. `python -c "import server"` from the venv should take about 2 seconds |
+| First search after startup takes a few seconds | The index loads in the background after the handshake. Later searches are fast |
+
+Native libraries are imported before the MCP transport starts on purpose: importing them afterwards deadlocks on Windows. See the docstring at the top of `server.py`.
+
+---
+
+# Upstream documentation
+
 Exposes your Obsidian Smart Connections vector database to Claude Code via Model Context Protocol (MCP).
 
 ## What This Does
